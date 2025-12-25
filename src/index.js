@@ -10,6 +10,9 @@ const express = require("express");
 const cors = require("cors");
 const cookieParser = require("cookie-parser");
 const mysql = require("mysql2/promise");
+const bcrypt = require("bcrypt");
+const jwt = require("jsonwebtoken");
+
 
 const app = express();
 
@@ -47,6 +50,39 @@ const pool = mysql.createPool({
   queueLimit: 0,
   ssl: { rejectUnauthorized: false },
 });
+
+function signToken(payload) {
+    return jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: "7d" });
+  }
+  
+  function authCookieOptions() {
+    const secure = String(process.env.COOKIE_SECURE) === "true";
+    return {
+      httpOnly: true,
+      secure,
+      sameSite: secure ? "none" : "lax", // cross-site cookies require Secure + None
+      path: "/",
+      maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+    };
+  }
+  
+  function requireAuth(req, res, next) {
+    try {
+      const token = req.cookies?.token;
+      if (!token) return res.status(401).json({ message: "Unauthorized" });
+  
+      const decoded = jwt.verify(token, process.env.JWT_SECRET);
+      req.user = decoded; // { id, role }
+      next();
+    } catch {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+  }
+  
+  function requireAdmin(req, res, next) {
+    if (req.user?.role !== "admin") return res.status(403).json({ message: "Forbidden" });
+    next();
+  }
 
 // --------- Routes ----------
 app.get("/health", async (_req, res) => {
@@ -111,6 +147,92 @@ app.get("/menu", async (_req, res) => {
 
 // --------- Start Server ----------
 const port = Number(process.env.PORT || 8080);
+
+app.post("/auth/register", async (req, res) => {
+    try {
+      const { name, email, password } = req.body || {};
+      if (!name || !email || !password) {
+        return res.status(400).json({ message: "name, email, password are required" });
+      }
+  
+      const normalizedEmail = String(email).trim().toLowerCase();
+  
+      const passwordHash = await bcrypt.hash(password, 10);
+  
+      const [result] = await pool.query(
+        `INSERT INTO users (name, email, password_hash, role)
+         VALUES (?, ?, ?, 'user')`,
+        [name.trim(), normalizedEmail, passwordHash]
+      );
+  
+      const user = { id: result.insertId, name: name.trim(), email: normalizedEmail, role: "user" };
+  
+      const token = signToken({ id: user.id, role: user.role });
+      res.cookie("token", token, authCookieOptions());
+  
+      res.status(201).json({ user });
+    } catch (e) {
+      // duplicate email
+      if (e?.code === "ER_DUP_ENTRY") {
+        return res.status(409).json({ message: "Email already registered" });
+      }
+      res.status(500).json({ message: "Register failed", error: e.message });
+    }
+  });
+  
+  app.post("/auth/login", async (req, res) => {
+    try {
+      const { email, password } = req.body || {};
+      if (!email || !password) return res.status(400).json({ message: "email and password are required" });
+  
+      const normalizedEmail = String(email).trim().toLowerCase();
+  
+      const [rows] = await pool.query(
+        `SELECT id, name, email, password_hash, role, is_active
+         FROM users
+         WHERE email = ?
+         LIMIT 1`,
+        [normalizedEmail]
+      );
+  
+      const u = rows[0];
+      if (!u || !u.is_active) return res.status(401).json({ message: "Invalid credentials" });
+  
+      const ok = await bcrypt.compare(password, u.password_hash);
+      if (!ok) return res.status(401).json({ message: "Invalid credentials" });
+  
+      const token = signToken({ id: u.id, role: u.role });
+      res.cookie("token", token, authCookieOptions());
+  
+      res.json({ user: { id: u.id, name: u.name, email: u.email, role: u.role } });
+    } catch (e) {
+      res.status(500).json({ message: "Login failed", error: e.message });
+    }
+  });
+  
+  app.get("/auth/me", requireAuth, async (req, res) => {
+    try {
+      const [rows] = await pool.query(
+        `SELECT id, name, email, role
+         FROM users
+         WHERE id = ?
+         LIMIT 1`,
+        [req.user.id]
+      );
+  
+      const u = rows[0];
+      if (!u) return res.status(401).json({ message: "Unauthorized" });
+  
+      res.json({ user: u });
+    } catch (e) {
+      res.status(500).json({ message: "Failed to fetch user", error: e.message });
+    }
+  });
+  
+  app.post("/auth/logout", (_req, res) => {
+    res.clearCookie("token", { path: "/" });
+    res.json({ ok: true });
+  });
 
 app.listen(port, async () => {
   try {
