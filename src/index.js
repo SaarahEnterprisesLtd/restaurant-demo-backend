@@ -1,17 +1,27 @@
-require("dotenv").config();
+// src/index.js (CommonJS)
+
+const path = require("path");
+require("dotenv").config({ path: path.resolve(__dirname, "../.env") });
+
+const dns = require("dns");
+dns.setDefaultResultOrder("ipv4first");
+
 const express = require("express");
 const cors = require("cors");
 const cookieParser = require("cookie-parser");
 const mysql = require("mysql2/promise");
 
 const app = express();
+
+// --------- Middleware ----------
 app.use(express.json());
 app.use(cookieParser());
 
-// Allow multiple origins (local + vercel later)
+// Allow multiple origins (local + Vercel later)
 const allowedOrigins = (process.env.CORS_ORIGIN || "http://localhost:5173")
   .split(",")
-  .map((s) => s.trim());
+  .map((s) => s.trim())
+  .filter(Boolean);
 
 app.use(
   cors({
@@ -25,7 +35,7 @@ app.use(
   })
 );
 
-// ✅ MySQL pool (DigitalOcean Managed MySQL uses TLS)
+// --------- MySQL Pool (DO Managed MySQL uses TLS) ----------
 const pool = mysql.createPool({
   host: process.env.DB_HOST,
   port: Number(process.env.DB_PORT || 3306),
@@ -38,16 +48,37 @@ const pool = mysql.createPool({
   ssl: { rejectUnauthorized: false },
 });
 
+// --------- Routes ----------
 app.get("/health", async (_req, res) => {
   try {
     const [rows] = await pool.query("SELECT 1 AS ok");
     res.json({ ok: true, db: rows[0]?.ok === 1 });
   } catch (e) {
-    res.status(500).json({ ok: false, db: false, error: e.message });
+    res.status(500).json({
+      ok: false,
+      db: false,
+      code: e?.code,
+      message: e?.message,
+      raw: String(e),
+    });
   }
 });
 
-// ✅ Public menu endpoint
+app.get("/db-test", async (_req, res) => {
+  try {
+    const [rows] = await pool.query("SELECT 1 AS ok");
+    res.json({ ok: true, db: rows[0]?.ok === 1 });
+  } catch (e) {
+    res.status(500).json({
+      ok: false,
+      code: e?.code,
+      message: e?.message,
+      raw: String(e),
+    });
+  }
+});
+
+// Public menu endpoint
 app.get("/menu", async (_req, res) => {
   try {
     const [rows] = await pool.query(
@@ -57,11 +88,11 @@ app.get("/menu", async (_req, res) => {
        ORDER BY sort_order ASC, id DESC`
     );
 
-    // convert cents → pounds for your current frontend
     const items = rows.map((r) => ({
       id: r.id,
       name: r.name,
       description: r.description,
+      // cents → pounds (as string "9.99")
       price: (Number(r.price_cents) / 100).toFixed(2),
       currency: r.currency,
       imageUrl: r.imageUrl,
@@ -69,26 +100,24 @@ app.get("/menu", async (_req, res) => {
 
     res.json({ items });
   } catch (e) {
-    res.status(500).json({ message: "Failed to load menu", error: e.message });
+    res.status(500).json({
+      message: "Failed to load menu",
+      code: e?.code,
+      error: e?.message,
+      raw: String(e),
+    });
   }
 });
 
-app.get("/db-test", async (_req, res) => {
-    try {
-      const [rows] = await pool.query("SELECT 1 AS ok");
-      res.json({ ok: true, db: rows[0].ok });
-    } catch (e) {
-      res.status(500).json({ ok: false, error: e.message });
-    }
-  });
+// --------- Start Server ----------
+const port = Number(process.env.PORT || 8080);
 
-const port = process.env.PORT || 8080; // ✅ use 8080 for Railway
 app.listen(port, async () => {
   try {
     const [rows] = await pool.query("SELECT 1 AS ok");
     console.log("DB connected:", rows[0]?.ok === 1);
   } catch (e) {
-    console.log("DB connected: false", e.message);
+    console.log("DB connected: false", e?.code, e?.message);
   }
   console.log("API running on", port);
 });
