@@ -90,8 +90,8 @@ function authCookieOptions() {
 
   return {
     httpOnly: true,
-    secure, // true in production (HTTPS)
-    sameSite: "lax", // ✅ subdomains are same-site (app.domain.com <-> api.domain.com)
+    secure:true, // true in production (HTTPS)
+    sameSite: "none", // ✅ subdomains are same-site (app.domain.com <-> api.domain.com)
     path: "/",
     maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days cookie lifetime (token may expire earlier)
 
