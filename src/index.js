@@ -15,6 +15,8 @@ const jwt = require("jsonwebtoken");
 const crypto = require("crypto");
 const multer = require("multer");
 const cloudinary = require("cloudinary").v2;
+const Stripe = require("stripe");
+const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
 
 const app = express();
 
@@ -62,6 +64,15 @@ function uploadBuffer(buffer, options = {}) {
     });
     stream.end(buffer);
   });
+}
+
+function optionalAuth(req, _res, next) {
+  const token = req.cookies?.token;
+  if (!token) return next();
+  try {
+    req.user = jwt.verify(token, process.env.JWT_SECRET);
+  } catch {}
+  next();
 }
 
 // --------- MySQL Pool (DO Managed MySQL uses TLS) ----------
@@ -170,6 +181,450 @@ async function getOrCreateActiveCartId(userId) {
   return result.insertId;
 }
 
+app.post("/payments/create-intent", optionalAuth, async (req, res) => {
+  try {
+    const isUser = Boolean(req.user?.id);
+
+    // Load cart items (server-truth)
+    let items = [];
+    let currency = "GBP";
+
+    if (isUser) {
+      const cartId = await getOrCreateActiveCartId(req.user.id);
+      const [rows] = await pool.query(
+        `SELECT ci.menu_item_id AS id, mi.name, ci.qty, ci.unit_price_cents, ci.currency
+         FROM cart_items ci
+         JOIN menu_items mi ON mi.id = ci.menu_item_id
+         WHERE ci.cart_id = ?`,
+        [cartId]
+      );
+      items = rows.map(r => ({
+        id: Number(r.id),
+        name: r.name,
+        qty: Number(r.qty),
+        price_cents: Number(r.unit_price_cents),
+        currency: r.currency || "GBP",
+      }));
+    } else {
+      const token = req.cookies?.guest_cart;
+      if (token) {
+        const [rows] = await pool.query(
+          `SELECT cart_json FROM guest_carts WHERE token = ? LIMIT 1`,
+          [token]
+        );
+        const raw = rows[0]?.cart_json;
+        const data = !raw ? { items: [] } : (typeof raw === "string" ? JSON.parse(raw) : raw);
+        items = Array.isArray(data?.items) ? data.items : [];
+      }
+      // guest items already contain price_cents
+      items = items.map(x => ({
+        id: Number(x.id),
+        name: x.name,
+        qty: Number(x.qty || 1),
+        price_cents: Number(x.price_cents),
+        currency: x.currency || "GBP",
+      }));
+    }
+
+    if (!items.length) return res.status(400).json({ message: "Cart is empty" });
+
+    currency = items[0]?.currency || "GBP";
+    const subtotal_cents = items.reduce((sum, it) => sum + it.price_cents * it.qty, 0);
+
+    // If you have delivery/tax logic, compute here. For now 0.
+    const delivery_cents = 0;
+    const tax_cents = 0;
+    const total_cents = subtotal_cents + delivery_cents + tax_cents;
+
+    const paymentIntent = await stripe.paymentIntents.create({
+      
+      amount: total_cents,
+      currency: String(currency).toLowerCase(),
+      automatic_payment_methods: { enabled: true },
+      metadata: {
+        userType: isUser ? "user" : "guest",
+        userId: isUser ? String(req.user.id) : "",
+      },
+    });
+    console.log(
+      "Stripe key loaded:",
+      process.env.STRIPE_SECRET_KEY?.slice(0, 10)
+    );
+
+    return res.json({
+      clientSecret: paymentIntent.client_secret,
+      amount: total_cents,
+      currency: String(currency).toLowerCase(),
+    });
+  } catch (e) {
+    console.error("create-intent error:", e);
+    res.status(500).json({ message: "Failed to create payment intent", error: e?.message });
+  }
+});
+
+app.post("/orders/confirm", optionalAuth, async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    const {
+      paymentIntentId,
+      notes,
+      delivery_name,
+      delivery_phone,
+      delivery_address_line1,
+      delivery_address_line2,
+      delivery_city,
+      delivery_postcode,
+    } = req.body || {};
+
+    if (!paymentIntentId) {
+      return res.status(400).json({ message: "Missing paymentIntentId" });
+    }
+
+    // 1) Verify with Stripe
+    const pi = await stripe.paymentIntents.retrieve(paymentIntentId);
+
+    if (pi.status !== "succeeded" && pi.status !== "processing") {
+      return res.status(400).json({ message: `Payment not complete. Status: ${pi.status}` });
+    }
+
+    // 2) Idempotency: if order already exists for PI, return it
+    const [existing] = await conn.query(
+      `SELECT id FROM orders WHERE stripe_payment_intent_id = ? LIMIT 1`,
+      [paymentIntentId]
+    );
+    if (existing[0]) {
+      return res.json({ ok: true, orderId: existing[0].id, alreadyConfirmed: true });
+    }
+
+    // 3) Load cart items (server-truth)
+    const isUser = Boolean(req.user?.id);
+    let items = [];
+    let cartId = null;
+    let guestToken = null;
+
+    if (isUser) {
+      cartId = await getOrCreateActiveCartId(req.user.id);
+      const [rows] = await conn.query(
+        `SELECT ci.menu_item_id AS id, mi.name, ci.qty, ci.unit_price_cents AS price_cents, ci.currency
+         FROM cart_items ci
+         JOIN menu_items mi ON mi.id = ci.menu_item_id
+         WHERE ci.cart_id = ?`,
+        [cartId]
+      );
+      items = rows.map(r => ({
+        id: Number(r.id),
+        name_snapshot: r.name,
+        qty: Number(r.qty),
+        price_cents: Number(r.price_cents),
+        currency: r.currency || "GBP",
+      }));
+    } else {
+      guestToken = req.cookies?.guest_cart || null;
+      if (guestToken) {
+        const [rows] = await conn.query(
+          `SELECT cart_json FROM guest_carts WHERE token = ? LIMIT 1`,
+          [guestToken]
+        );
+        const raw = rows[0]?.cart_json;
+        const data = !raw ? { items: [] } : (typeof raw === "string" ? JSON.parse(raw) : raw);
+        const guestItems = Array.isArray(data?.items) ? data.items : [];
+
+        items = guestItems.map(x => ({
+          id: Number(x.id),
+          name_snapshot: x.name,
+          qty: Number(x.qty || 1),
+          price_cents: Number(x.price_cents),
+          currency: x.currency || "GBP",
+        }));
+      }
+    }
+
+    if (!items.length) return res.status(400).json({ message: "Cart is empty" });
+
+    const currency = items[0]?.currency || "GBP";
+    const subtotal_cents = items.reduce((sum, it) => sum + it.price_cents * it.qty, 0);
+    const delivery_cents = 0;
+    const tax_cents = 0;
+    const total_cents = subtotal_cents + delivery_cents + tax_cents;
+
+    // 4) Safety: verify Stripe amount matches what we computed
+    if (typeof pi.amount === "number" && pi.amount !== total_cents) {
+      return res.status(400).json({ message: "Payment amount mismatch" });
+    }
+
+    await conn.beginTransaction();
+
+    // 5) Insert into orders (your schema)
+    const [orderResult] = await conn.query(
+      `INSERT INTO orders
+        (user_id, status, subtotal_cents, delivery_cents, tax_cents, total_cents, currency,
+         notes, delivery_name, delivery_phone,
+         delivery_address_line1, delivery_address_line2, delivery_city, delivery_postcode,
+         payment_status, stripe_payment_intent_id, stripe_client_secret, placed_at, updated_at)
+       VALUES
+        (?, ?, ?, ?, ?, ?, ?,
+         ?, ?, ?,
+         ?, ?, ?, ?,
+         ?, ?, ?, NOW(), NOW())`,
+      [
+        isUser ? req.user.id : null,
+        "placed",
+        subtotal_cents,
+        delivery_cents,
+        tax_cents,
+        total_cents,
+        currency,
+
+        notes || null,
+        delivery_name || null,
+        delivery_phone || null,
+        delivery_address_line1 || null,
+        delivery_address_line2 || null,
+        delivery_city || null,
+        delivery_postcode || null,
+
+        pi.status === "succeeded" ? "paid" : "processing",
+        paymentIntentId,
+        pi.client_secret || null,
+      ]
+    );
+
+    const orderId = orderResult.insertId;
+
+    // 6) Insert order_items
+    for (const it of items) {
+      await conn.query(
+        `INSERT INTO order_items
+          (order_id, menu_item_id, name_snapshot, price_cents, qty, created_at)
+         VALUES (?, ?, ?, ?, ?, NOW())`,
+        [orderId, it.id, it.name_snapshot, it.price_cents, it.qty]
+      );
+    }
+
+    // 7) Clear carts
+    if (isUser) {
+      await conn.query(`DELETE FROM cart_items WHERE cart_id = ?`, [cartId]);
+    } else {
+      if (guestToken) {
+        await conn.query(`DELETE FROM guest_carts WHERE token = ?`, [guestToken]);
+      }
+      // clear cookie
+      const isProd = process.env.NODE_ENV === "production";
+      res.clearCookie("guest_cart", {
+        path: "/",
+        ...(isProd && process.env.COOKIE_DOMAIN ? { domain: process.env.COOKIE_DOMAIN } : {}),
+      });
+    }
+
+    await conn.commit();
+    return res.json({ ok: true, orderId });
+  } catch (e) {
+    try { await conn.rollback(); } catch {}
+    console.error("orders/confirm error:", e);
+    return res.status(500).json({ message: "Failed to confirm order", error: e?.message });
+  } finally {
+    conn.release();
+  }
+});
+
+app.get("/orders/me", requireAuth, async (req, res) => {
+  try {
+    const [rows] = await pool.query(
+      `SELECT id, status, total_cents, currency, placed_at, updated_at
+       FROM orders
+       WHERE user_id = ?
+       ORDER BY placed_at DESC, id DESC
+       LIMIT 100`,
+      [req.user.id]
+    );
+
+    res.json({
+      orders: rows.map((o) => ({
+        id: o.id,
+        status: o.status,
+        total: Number(o.total_cents || 0) / 100,
+        currency: o.currency || "GBP",
+        placedAt: o.placed_at,
+        updatedAt: o.updated_at,
+      })),
+    });
+  } catch (e) {
+    res.status(500).json({ message: "Failed to load orders", error: e?.message });
+  }
+});
+
+app.get("/orders/:id", requireAuth, async (req, res) => {
+  try {
+    const orderId = Number(req.params.id);
+    if (!Number.isFinite(orderId)) return res.status(400).json({ message: "Invalid order id" });
+
+    // Ensure the order belongs to the user
+    const [orderRows] = await pool.query(
+      `SELECT * FROM orders WHERE id = ? AND user_id = ? LIMIT 1`,
+      [orderId, req.user.id]
+    );
+    const order = orderRows[0];
+    if (!order) return res.status(404).json({ message: "Order not found" });
+
+    const [items] = await pool.query(
+      `SELECT
+         id,
+         menu_item_id,
+         name_snapshot,
+         price_cents,
+         qty,
+         created_at
+       FROM order_items
+       WHERE order_id = ?
+       ORDER BY id ASC`,
+      [orderId]
+    );
+
+    res.json({ order, items });
+  } catch (e) {
+    console.error("GET /orders/:id failed:", e);
+    res.status(500).json({ message: "Failed to load order", error: e?.message });
+  }
+});
+
+app.get("/admin/orders", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const status = (req.query.status || "").trim();
+    const q = (req.query.q || "").trim(); // order id or email/name search
+    const limit = Math.min(Number(req.query.limit || 50), 200);
+
+    const where = [];
+    const params = [];
+
+    if (status) {
+      where.push("o.status = ?");
+      params.push(status);
+    }
+
+    if (q) {
+      // allow searching by order id or user email/name
+      if (/^\d+$/.test(q)) {
+        where.push("o.id = ?");
+        params.push(Number(q));
+      } else {
+        where.push("(u.email LIKE ? OR u.name LIKE ?)");
+        params.push(`%${q}%`, `%${q}%`);
+      }
+    }
+
+    const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
+
+    const [rows] = await pool.query(
+      `SELECT
+         o.id,
+         o.user_id,
+         o.status,
+         o.total_cents,
+         o.currency,
+         o.payment_status,
+         o.placed_at,
+         o.updated_at,
+         u.name AS user_name,
+         u.email AS user_email
+       FROM orders o
+       LEFT JOIN users u ON u.id = o.user_id
+       ${whereSql}
+       ORDER BY o.placed_at DESC, o.id DESC
+       LIMIT ${limit}`,
+      params
+    );
+
+    res.json({ orders: rows });
+  } catch (e) {
+    console.error("GET /admin/orders failed:", e);
+    res.status(500).json({ message: "Failed to load orders", error: e?.message });
+  }
+});
+
+app.get("/admin/orders/:id", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const orderId = Number(req.params.id);
+    if (!Number.isFinite(orderId)) return res.status(400).json({ message: "Invalid order id" });
+
+    const [orderRows] = await pool.query(
+      `SELECT
+         o.*,
+         u.name AS user_name,
+         u.email AS user_email
+       FROM orders o
+       LEFT JOIN users u ON u.id = o.user_id
+       WHERE o.id = ?
+       LIMIT 1`,
+      [orderId]
+    );
+    const order = orderRows[0];
+    if (!order) return res.status(404).json({ message: "Order not found" });
+
+    const [items] = await pool.query(
+      `SELECT
+         id,
+         menu_item_id,
+         name_snapshot,
+         price_cents,
+         qty,
+         created_at
+       FROM order_items
+       WHERE order_id = ?
+       ORDER BY id ASC`,
+      [orderId]
+    );
+
+    res.json({ order, items });
+  } catch (e) {
+    console.error("GET /admin/orders/:id failed:", e);
+    res.status(500).json({ message: "Failed to load order", error: e?.message });
+  }
+});
+
+const ALLOWED_ORDER_STATUSES = new Set([
+  "pending",
+  "placed",
+  "preparing",
+  "ready",
+  "out_for_delivery",
+  "delivered",
+  "cancelled",
+]);
+
+app.patch("/admin/orders/:id/status", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const orderId = Number(req.params.id);
+    if (!Number.isFinite(orderId)) return res.status(400).json({ message: "Invalid order id" });
+
+    const nextStatus = String(req.body?.status || "").trim().toLowerCase();
+    if (!ALLOWED_ORDER_STATUSES.has(nextStatus)) {
+      return res.status(400).json({
+        message: "Invalid status",
+        allowed: Array.from(ALLOWED_ORDER_STATUSES),
+      });
+    }
+
+    const [rows] = await pool.query(
+      `SELECT id, status FROM orders WHERE id = ? LIMIT 1`,
+      [orderId]
+    );
+    if (!rows[0]) return res.status(404).json({ message: "Order not found" });
+
+    await pool.query(
+      `UPDATE orders SET status = ?, updated_at = NOW() WHERE id = ?`,
+      [nextStatus, orderId]
+    );
+
+    // Optional: if you use sockets, emit order updates here
+    // io.to("admins").emit("orderUpdate", { orderId, status: nextStatus, updatedAt: new Date().toISOString() });
+
+    res.json({ ok: true, orderId, status: nextStatus });
+  } catch (e) {
+    console.error("PATCH /admin/orders/:id/status failed:", e);
+    res.status(500).json({ message: "Failed to update status", error: e?.message });
+  }
+});
+
 app.post(
   "/admin/upload-image",
   requireAuth,
@@ -209,6 +664,38 @@ app.post(
     }
   }
 );
+
+app.post("/orders/:id/cancel", requireAuth, async (req, res) => {
+  try {
+    const orderId = Number(req.params.id);
+    if (!Number.isFinite(orderId)) return res.status(400).json({ message: "Invalid order id" });
+
+    // ensure belongs to user + check status
+    const [rows] = await pool.query(
+      `SELECT id, status FROM orders WHERE id = ? AND user_id = ? LIMIT 1`,
+      [orderId, req.user.id]
+    );
+    const order = rows[0];
+    if (!order) return res.status(404).json({ message: "Order not found" });
+
+    const cancellable = ["pending", "placed"].includes(String(order.status || "").toLowerCase());
+    if (!cancellable) {
+      return res.status(400).json({
+        message: `Order cannot be cancelled when status is "${order.status}".`,
+      });
+    }
+
+    await pool.query(
+      `UPDATE orders SET status = 'cancelled', updated_at = NOW() WHERE id = ?`,
+      [orderId]
+    );
+
+    res.json({ ok: true, orderId, status: "cancelled" });
+  } catch (e) {
+    console.error("POST /orders/:id/cancel failed:", e);
+    res.status(500).json({ message: "Failed to cancel order", error: e?.message });
+  }
+});
 
 // --------- Routes ----------
 app.get("/health", async (_req, res) => {
